@@ -77,7 +77,7 @@ transactions_summary_df %<>% anti_join( unpopular_products, by = "PRODUCT_ID" )
 # determine and mark the top 500 products as calibration targets for hyper-parameter tuning
 n_test_products <- 200
 calibration_products_df <- sample_n(product_freq[1:1500,], n_test_products)
-calibration_products <- calibration_products_df$PRODUCT_ID
+calibration_products <- calibration_products_df$PRODUCT_ID %>% as.character()
 #transactions_summary_df %<>% mutate( is_calibration_product = (PRODUCT_ID %in% calibration_products) )
 
 ```
@@ -144,12 +144,13 @@ seasonality_weekly_mat <-
 rownames(seasonality_weekly_mat) <- seasonality_weekly_mat$PRODUCT_ID
 seasonality_weekly_mat %<>% .[,-1] %>% as.matrix()
 seasonality_weekly_corr_upper <- corr_posterior_mat(seasonality_weekly_mat)
-
+seasonality_weekly_corr_upper %<>% .[calibration_products, calibration_products]
 ```
 
 ```{r}
 seasonality_monthly_mat <-
     transactions_df %>% 
+    semi_join(calibration_products_df, by = "PRODUCT_ID") %>% 
     group_by(PRODUCT_ID, month) %>%
     summarize(quantity = sum(QUANTITY)) %>%
     group_by(PRODUCT_ID) %>%
@@ -157,17 +158,12 @@ seasonality_monthly_mat <-
     pivot_wider(names_from = "month", values_from = "quantity", values_fill = 0)
 
 seasonality_monthly_mat %<>%
-    semi_join( volumes_correlation, by = "PRODUCT_ID" ) %>%
     select(PRODUCT_ID, `0`, `1`, `2`, `3`, `4`, `5`, `6`, `7`, `8`, `9`, `10`, `11`) %>% 
     as.data.frame()
 rownames(seasonality_monthly_mat) <- seasonality_monthly_mat$PRODUCT_ID
 seasonality_monthly_mat %<>% .[,-1] %>% as.matrix()
-seasonality_monthly_cor <- cor(t(seasonality_monthly_mat))
-
-```
-
-```{r}
-log_similarity_seasonal_mat <- log( (seasonality_weekly_cor/2 + .5) * (seasonality_monthly_cor/2 + .5) )
+seasonality_monthly_corr_upper <- corr_posterior_mat(seasonality_monthly_mat)
+seasonality_monthly_corr_upper %<>% .[calibration_products, calibration_products]
 ```
 
 ```{r}
@@ -182,153 +178,114 @@ log_similarity_price <- function(price_1, prices_2, log_price_1, log_prices_2) {
   log_similarity_price_absolute(price_1, prices_2) +
   log_similarity_price_relative(log_price_1, log_prices_2)
 }
-log_similarity_seasonal <- function(product_1, products_2) {
-  if (product_1 %in% names(similarity_seasonal_mat)) {
-    log_similarity_seasonal_product <- log_similarity_seasonal_mat[product_1,][products_2]
-    ifelse(is.na(log_similarity_seasonal_product), log(0.5), log_similarity_seasonal_product)
-  } else {
-    rep(log(0.5), length(products_2))
-  }
-}
-log_similarity_complete <- function(product_1, products_2, price_1, prices_2, log_price_1, log_prices_2) {
-  log_similarity_seasonal(product_1, products_2) + 
+```
+
+```{r}
+
+log_similarity_price_mat <-
+sapply(calibration_products, \(product_1) {
+    price_1 <- exp(log_list_prices[as.character(product_1)])
+    log_price_1 <- log_list_prices[as.character(product_1)]
+
+    prices_2 <- exp(log_list_prices[as.character(calibration_products)])
+    log_prices_2 <- log_list_prices[as.character(calibration_products)]
     log_similarity_price(price_1, prices_2, log_price_1, log_prices_2)
-}
+})
+log_similarity_price_mat %<>% .[calibration_products, calibration_products]
+```
 
+```{r}
+log_prior_similarity_mat <-
+      log( (seasonality_weekly_corr_upper/2 + .5) ) + 
+      log( (seasonality_monthly_corr_upper/2 + .5) ) +
+      log_similarity_price_mat
+```
+
+```{r}
+#View(log_prior_similarity_mat %>% exp() %>% round(2))
 ```
 
 ```{r}
 
-product_1 = "1033142"
-products_2 = vocabulary[1:100]
-
-cur_product_id = "1033142"
-cur_product_id_2 = "1033142X"
-
-loglik_similarity_ratios <- function(embeddings, log_prices, cur_product_id)
+get_word2vec <- function(x, dim, window, iter)
 {
-    is_target <- rownames(embeddings) == cur_product_id
+    fname <- sprintf("models/w2v_%d_%d_%d.model", dim, window, iter)
+    if (file.exists(fname)) {
+      model <- word2vec::read.word2vec(file = fname)
 
-    word2vec_similarities <- word2vec::word2vec_similarity(embeddings[cur_product_id,], 
-                                                           embeddings[products_2,], 
-                                                           type = "cosine")[1,]/2 + 0.5
+    } else {
+      set.seed(123456789)
 
-    log_prior_similarities <- log_similarity_complete(product_1, products_2, 
-                                                      price_1, prices_2, 
-                                                      log_price_1, log_prices_2)
-
-    plot(log_prior_similarities, log(word2vec_similarities))
-
-    cbind(log_prior_similarities, lword2vec_similarities=log(word2vec_similarities)) %>% View()
-    
-    # ###
-    # product_df %>% filter(PRODUCT_ID %in% c("1033142", "1022223")) %>% as.data.frame()
-    # ###
-    # 
-    # 
-    # similarities_1x <- similarities[1, !is_product_2 & !is_product_1]
-    # rel_log_prices_1x <- abs( log_prices[!is_product_2 & !is_product_1] - log_prices[is_product_1] )
-    # 
-    # m <- glm( similarities_1x ~ rel_log_prices_1x, family = binomial("logit") ) 
-    # logLik(m) # -86141.65
-    # 
-    # plot(log(rel_log_prices_1x), similarities_1x)
-    # x = c(0.1, 0.5, 1, 2, 3, 4, 5, 6)
-    # y = predict(m, data.frame(rel_log_prices_1x = x)) %>% plogis()
-    # points(x, y, col = "red", type = "l")
-    # 
-    # log_prices[is_product_2]
-    # log_prices[is_product_1]
-    # 
-    # similarities_12 <- similarities[1, is_product_2]
-    # similarities_1x <- similarities[1, !is_product_2 & !is_product_1]
-    # similarities_21 <- similarities[2, is_product_1]
-    # similarities_2x <- similarities[2, !is_product_1 & !is_product_2]
-    # 
-    # log(dsimilar( similarities_12 )) + sum(dlsimilarity_mixture( similarities_1x )) +
-    # log(dsimilar( similarities_21 )) + sum(dlsimilarity_mixture( similarities_2x ))
-    # # log(similarities_12) + log(similarities_21) - sum(log(similarities_1x)) - sum(log(similarities_2x))
+      tic()
+      model <- word2vec(x = x, type = "cbow", dim = dim, window = window, iter = iter, threads = 8L)
+      word2vec::write.word2vec(model, file = fname)
+      toc()
+    }
+    model
 }
 
-```
-
-```{r}
-
-evaluate_model <- function(dim, window, iter = 20)
+evaluate_model <- function(dim, window, iter = 10)
 {
     # using: log_list_prices, transaction_baskets_df
-    set.seed(123456789)
 
-    model <- word2vec(x = transaction_baskets_df$basket, type = "cbow", 
-                      window = window, dim = dim, iter = iter, threads = 8L)
-
+    model <- get_word2vec(x = transaction_baskets_df$basket, dim = dim, window = window, iter = iter)
     embeddings <- as.matrix(model)
-    vocabulary <- rownames(embeddings)
-    n_vocabulary <- nrow(embeddings)
-    selected_products_test <- products_test %>% 
-                              filter(PRODUCT_ID %in% vocabulary, PRODUCT_ID_ALT %in% vocabulary)
-    log_prices <- log_list_prices[vocabulary]
-    
-    n <- 100
-    similarity_complete(product_1 = vocabulary[1], products_2 = vocabulary[1:n], 
-                        price_1 = exp(log_prices[1]), prices_2 = exp(log_prices[1:n]), 
-                        log_price_1 = log_prices[1], log_prices_2 = log_prices[1:n])
 
+    vocabulary <- rownames(embeddings)
+    selected_calibration_products <- calibration_products[calibration_products %in% vocabulary]
+
+    word2vec_similarities <- word2vec::word2vec_similarity(
+                                  embeddings[selected_calibration_products,],
+                                  embeddings[selected_calibration_products,], 
+                                  type = "cosine")/2 + 0.5
+    log_prior_similarities <- log_prior_similarity_mat[selected_calibration_products,
+                                                       selected_calibration_products]
+
+    log_prior_similarities = as.vector(log_prior_similarities)
+    log_estimated_similarities = as.vector(log(word2vec_similarities))
     
-    loglik <- purrr::map_dbl(1:100, function(i) {
-        loglik_similarity_ratios(embeddings[1:n], log_prices[1:n], vocabulary[1:n], vocabulary[i])
-    }, .progress = "text")
+    cor(log_prior_similarities, log_estimated_similarities)
     
-    sum(loglik)
+    plot(log_prior_similarities, log_estimated_similarities)
+    
+    est_res <- max_loglik_mixture_similarity(as.vector(log_prior_similarities), 
+                                             as.vector(log(word2vec_similarities)))
+        
+    est_res$value
 }
+```
+
+```{r}
+
+evaluate_model(dim = 10, window = 10, iter = 10)
+
+evaluate_model(dim = 50, window = 10, iter = 10)
+
+evaluate_model(dim = 75, window = 10, iter = 10)
+
 
 ```
 
 ```{r}
 
-params <- data.frame(dim = c(2, 10, 20, 50, 100, 150), window = 9)
-
+params <- crossing(dim = c(2, 10, 20, 50, 100, 150), window = c(10, 15))
 fit <- params %>% group_by(dim, window) %>% summarize( fit = evaluate_model(dim, window) )
-fit
 
-params2 <- data.frame(dim = c(50, 100, 150), window = 9)
+params2 <- crossing(dim = c(200, 250, 300, 400, 500, 600), window = c(15, 20))
 fit2 <- params2 %>% group_by(dim, window) %>% summarize( fit = evaluate_model(dim, window) )
-fit2
 
+params3 <- crossing(dim = c(800, 1000, 1200, 1500), window = c(15, 20, 30))
+fit3 <- params3 %>% group_by(dim, window) %>% summarize( fit = evaluate_model(dim, window) )
 
-fit %>% bind_rows(fit2)
+params4 <- crossing(dim = c(1750, 2000, 2500, 3000), window = c(30, 40))
+fit4 <- params4 %>% group_by(dim, window) %>% summarize( fit = evaluate_model(dim, window) )
 
-fit2A <- evaluate_model(dim = 50, window = 9)
-fit2B <- evaluate_model(dim = 100, window = 9)
-fit2C <- evaluate_model(dim = 150, window = 9)
+params5 <- crossing(dim = c(5000, 7500, 10000), window = c(40, 50))
+fit5 <- params5 %>% group_by(dim, window) %>% summarize( fit = evaluate_model(dim, window) )
 
-
-embeddings[c("397896", "397896X"),]
-
-cur_product_id_1 = "397896"
-cur_product_id_2 = "397896X"
-
-similarities <- word2vec::word2vec_similarity(embeddings, embeddings, type = "cosine")
-
-
-log_log_ratios
-
-word2vec::word2vec_similarity(embeddings[1,], embeddings[2,])
-
-word2vec::word2vec_similarity(embeddings["397896",], embeddings[2,])
-
-word2vec::word2vec_similarity(embeddings[1,], embeddings["397896X",])
-
-
-word2vec::word2vec_similarity(embeddings[c("8022241", "397896"),], embeddings[c("8022241", "397896X"),], type = "cosine")
-
-
-
-embeddings[c("397896", "397896X"),]
-
-similarities2 <- predict(model, products_test$PRODUCT_ID_ALT, type = "nearest", top_n = n_vocabulary)
-
-
+fit %>% bind_rows(fit2) %>% bind_rows(fit3) %>% bind_rows(fit4) %>% bind_rows(fit5) %>% 
+  filter(dim >= 800) %>%
+  ggplot(aes(dim, fit, color = as.factor(window) )) + geom_point() + geom_line()
 ```
 
 ```{r}

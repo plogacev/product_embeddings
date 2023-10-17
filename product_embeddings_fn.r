@@ -1,4 +1,67 @@
 
+
+max_loglik_mixture_similarity <- function(log_prior_similarities, log_estimated_similarities)
+{
+  loglik_mixture_similarity <- function(
+    log_prior_similarities, log_estimated_similarities,
+    p_max_related,
+    mu_unrelated, sigma_unrelated, 
+    mu_related, sigma_related)
+  {
+    p_related <- p_max_related * exp(log_prior_similarities)
+    log_p_mix <- log( p_related )
+    log_pm1_mix <- log( 1-p_related )
+    
+    loglik_unrelated <- dnorm(log_estimated_similarities, mean = mu_unrelated, sd = sigma_unrelated, log = T)
+    loglik_related <- dnorm(log_estimated_similarities, mean = mu_related, sd = sigma_related, log = T)
+    
+    loglik_rowwise <- cbind(log_p_mix+loglik_related, log_pm1_mix+loglik_unrelated)
+    matrixStats::rowLogSumExps(loglik_rowwise) %>% sum()
+  }
+  
+  transform_par <- function(par) {
+    par[["p_max_related"]] %<>% plogis()
+    par[["sigma_unrelated"]] %<>% exp()
+    par[["sigma_related"]] %<>% exp()
+    par
+  }
+  
+  loglik_mixture_similarity_optim <- function(par, 
+                                              log_prior_similarities, 
+                                              log_estimated_similarities)
+  {
+    par %<>% transform_par()
+    
+    loglik <-  
+      loglik_mixture_similarity(log_prior_similarities = log_prior_similarities,
+                                log_estimated_similarities = log_estimated_similarities,
+                                p_max_related = par[["p_max_related"]],
+                                mu_unrelated = par[["mu_unrelated"]], 
+                                sigma_unrelated = par[["sigma_unrelated"]],
+                                mu_related = par[["mu_related"]], 
+                                sigma_related = par[["sigma_related"]])
+    
+    #print(loglik)
+    loglik
+  }
+  
+  sample_median = median(log_estimated_similarities)
+  sample_sd = sd(log_estimated_similarities)
+  par_start <- c(p_max_related = qlogis(.1),
+                 mu_unrelated = sample_median, sigma_unrelated = log(sample_sd), 
+                 mu_related = sample_median/2, sigma_related = log(sample_sd))
+  
+  res <-
+    optim(par = par_start, loglik_mixture_similarity_optim, 
+          log_prior_similarities = log_prior_similarities, 
+          log_estimated_similarities = log_estimated_similarities, 
+          control = list(fnscale=-1, maxit = 10000) )
+  
+  res$par %<>% transform_par()
+  
+  res
+}
+
 corr_posterior <- function(y1, y2, n_samples = 1000)
 {
   # samples from the posterior of the poisson rates (lambda) associated with the vector x
