@@ -1,4 +1,80 @@
 
+get_word2vec <- function(x, dim, window, iter)
+{
+  fname <- sprintf("models/w2v_%d_%d_%d.model", dim, window, iter)
+  if (file.exists(fname)) {
+    model <- word2vec::read.word2vec(file = fname)
+    
+  } else {
+    set.seed(123456789)
+    
+    tic()
+    model <- word2vec(x = x, type = "cbow", dim = dim, window = window, iter = iter, threads = 8L)
+    word2vec::write.word2vec(model, file = fname)
+    toc()
+  }
+  model
+}
+
+evaluate_model_by_similarity_proximity <- function(calibration_products, dim, window, iter = 10)
+{
+  # using: log_list_prices, transaction_baskets_df
+  
+  model <- get_word2vec(x = transaction_baskets_df$basket, dim = dim, window = window, iter = iter)
+  embeddings <- as.matrix(model)
+  
+  vocabulary <- rownames(embeddings)
+  selected_calibration_products <- calibration_products[calibration_products %in% vocabulary]
+  
+  word2vec_similarities <- word2vec::word2vec_similarity(
+    embeddings[selected_calibration_products,],
+    embeddings[selected_calibration_products,], 
+    type = "cosine")/2 + 0.5
+  log_prior_similarities <- log_prior_similarity_mat[selected_calibration_products,
+                                                     selected_calibration_products]
+  prior_similarities <- exp(log_prior_similarities)
+
+  proximity_metric <- function(prior_similarities, word2vec_similarities)
+  {
+    word2vec_similarities_lower_tri <- word2vec_similarities %>% .[lower.tri(.)]
+    prior_similarities_lower_tri <- prior_similarities %>% .[lower.tri(.)]
+    
+    similarity    <- -1 * prior_similarities_lower_tri * log(word2vec_similarities_lower_tri)
+    dissimilarity <- -1 * (1-prior_similarities_lower_tri) * log(1-word2vec_similarities_lower_tri)
+    
+    -sum(log(similarity + dissimilarity))
+  }
+  
+  proximity_metric(prior_similarities, word2vec_similarities)
+}
+
+
+evaluate_model_by_dept_match <- function(selected_products, products_dept_match_mat, dim, window, iter = 10)
+{
+  # using: log_list_prices, transaction_baskets_df
+  
+  model <- get_word2vec(x = transaction_baskets_df$basket, dim = dim, window = window, iter = iter)
+  embeddings <- as.matrix(model)
+  
+  vocabulary <- rownames(embeddings)
+  selected_products <- selected_products[selected_products %in% vocabulary] %>% as.character()
+  
+  word2vec_similarities <- word2vec::word2vec_similarity(embeddings[selected_products,], embeddings[selected_products,], type = "cosine")/2 + 0.5
+  products_dept_match_mat <- products_dept_match_mat[selected_products, selected_products]
+
+  logloss_dept_match <- function(products_dept_match_mat, word2vec_similarities)
+  {
+    word2vec_similarities_lower_tri <- word2vec_similarities %>% .[lower.tri(.)]
+    products_dept_match_lower_tri <- products_dept_match_mat %>% .[lower.tri(.)]
+    
+    similarity    <- -1 * products_dept_match_lower_tri * log(word2vec_similarities_lower_tri)
+    dissimilarity <- -1 * (1-products_dept_match_lower_tri) * log(1-word2vec_similarities_lower_tri)
+    
+    -sum(log(similarity + dissimilarity))
+  }
+  
+  logloss_dept_match(products_dept_match_mat, word2vec_similarities)
+}
 
 max_loglik_mixture_similarity <- function(log_prior_similarities, log_estimated_similarities)
 {
