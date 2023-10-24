@@ -1,205 +1,171 @@
 
-get_word2vec <- function(x, dim, window, iter)
+library(Rcpp)
+
+source_cpp <- '
+// [[Rcpp::depends(RcppArmadillo)]]
+#include <RcppArmadillo.h>
+
+using namespace Rcpp;
+
+
+// [[Rcpp::export]]
+double calculate_distances(Rcpp::NumericVector x, Rcpp::NumericVector y)
 {
-  fname <- sprintf("models/w2v_%d_%d_%d.model", dim, window, iter)
+  // Calculate dot product
+  double similarities = std::inner_product(x.begin(), x.end(), y.begin(), 0.0);
+
+  // Calculate Euclidean norms
+  double x_scale = std::sqrt(std::inner_product(x.begin(), x.end(), x.begin(), 0.0));
+  double y_scale = std::sqrt(std::inner_product(y.begin(), y.end(), y.begin(), 0.0));
+
+  // Normalize and return
+  return similarities / (x_scale * y_scale);
+}
+
+// [[Rcpp::export]]
+Rcpp::NumericVector extract_distances(Rcpp::List embeddings, int idx_product_1, int idx_product_2)
+{
+  int n_models = embeddings.size();
+  Rcpp::NumericVector result(n_models);
+
+  for (int i_model = 0; i_model < n_models; ++i_model) {
+    Rcpp::NumericMatrix mat = Rcpp::as<Rcpp::NumericMatrix>(embeddings[i_model]);
+    Rcpp::NumericVector x = mat(idx_product_1-1, _);
+    Rcpp::NumericVector y = mat(idx_product_2-1, _);
+
+    result[i_model] = calculate_distances(x, y);
+  }
+
+  return result;
+}
+
+// [[Rcpp::export]]
+NumericVector summary_similarities_ij(Rcpp::List embeddings, int idx_product_1, int idx_product_2)
+{
+  NumericVector distances = extract_distances(embeddings, idx_product_1, idx_product_2);
+  arma::vec similarities = distances/2 + 0.5;
+
+  arma::vec target_quantiles = {0.025, 0.975};
+  arma::vec quantiles = arma::quantile(similarities, target_quantiles );
+  
+  return NumericVector::create(
+    mean(similarities),
+    stddev(similarities),
+    quantiles[0],
+    quantiles[1]
+  );
+}
+'
+
+# Save the C++ code to a file and load using sourceCpp
+cppFile <- tempfile(fileext = ".cpp")
+writeLines(source_cpp, cppFile)
+sourceCpp(cppFile)
+
+
+summary_similarities_i <- function(embeddings, idx_products, idx_target_product)
+{
+  x <- purrr::map_dfc(idx_products, \(j) {
+    summary_similarities_ij(embeddings, idx_product_1 = idx_target_product, idx_product_2 = j)
+  })
+  similarities_df <- matrix( unlist(x), ncol = 4, byrow = TRUE) %>% as.data.frame()
+  colnames(similarities_df) <- c("est", "se", "lower", "upper")
+  similarities_df$product_2 <- names(idx_products)
+  similarities_df$product_1 <- names(idx_target_product)
+  similarities_df %>% select(product_1, product_2, est, se, lower, upper)
+}
+
+compute_similarities <- function(embeddings, idx_products, idx_target_products)
+{
+  similarities_lst <- 
+    purrr::map(seq_along(idx_target_products), \(i) {
+      similarities_df <- summary_similarities_i(embeddings, idx_products, idx_target_products[i])
+      similarities_df %<>% arrange(desc(est))
+      similarities_df
+    }, .progress = TRUE)
+  names(similarities_lst) <- names(idx_target_products)
+  similarities_lst
+}
+
+
+embeddings_ensemble_word2vec <- function(baskets_lst, dim, window, iter, n_models) {
+  set.seed(12345)
+  fname <- sprintf("models/w2v_ensemble_%d_%d_%d_%d.rds", dim, window, iter, n_models)
+  if (file.exists(fname)) {
+    embeddings <- readRDS(file = fname)
+    
+  } else {
+    models <- purrr::map(1:n_models, \(i) {
+      baskets <- baskets_lst %>% sapply( function(x) paste(sample(x), collapse = " "))
+      word2vec(x = sample(baskets), type = "cbow", dim = dim, window = window, iter = iter, threads = 8L)
+    }, .progress = TRUE)
+    embeddings <- lapply(models, as.matrix)
+    saveRDS(embeddings, fname)
+  }
+  embeddings
+}
+
+
+
+get_word2vec <- function(x, dim, window, iter, n_resampled_baskets = 1)
+{
+  set.seed(12345678)
+  
+  cat(".")
+  fname <- sprintf("models/w2v_%d_%d_%d_%d.model", dim, window, iter, n_resampled_baskets)
   if (file.exists(fname)) {
     model <- word2vec::read.word2vec(file = fname)
     
   } else {
-    set.seed(123456789)
     
     tic()
-    model <- word2vec(x = x, type = "cbow", dim = dim, window = window, iter = iter, threads = 8L)
+    if (n_resampled_baskets > 1) {
+      x_original <- x
+      for (i in 2:n_resampled_baskets) {
+        x_resampled <- sample(x_original, replace = T)
+        x %<>% c( x_resampled )
+      }
+    }
+    
+    baskets <- x %>% sapply( function(x) paste(sample(x), collapse = " "))
+    model <- word2vec(x = baskets, type = "cbow", dim = dim, window = window, iter = iter, threads = 8L)
     word2vec::write.word2vec(model, file = fname)
     toc()
   }
+  
   model
 }
 
-evaluate_model_by_similarity_proximity <- function(calibration_products, dim, window, iter = 10)
+evaluate_model_loglik <- function(baskets_lst, calibration_products, dim, window, iter, n_resampled_baskets = 1)
 {
-  # using: log_list_prices, transaction_baskets_df
+  model <- get_word2vec(x = baskets_lst, dim = dim, window = window, iter = iter, n_resampled_baskets = n_resampled_baskets)
+  if (is.null(model)) {
+    return(NA)
+  }
   
-  model <- get_word2vec(x = transaction_baskets_df$basket, dim = dim, window = window, iter = iter)
   embeddings <- as.matrix(model)
+  vocabulary <- rownames(embeddings) %>% intersect( rownames(match_mat) )
+  selected_products <- calibration_products[calibration_products %in% vocabulary]
+  remaining_products <- vocabulary %>% setdiff(selected_products)
   
-  vocabulary <- rownames(embeddings)
-  selected_calibration_products <- calibration_products[calibration_products %in% vocabulary]
+  distances <- word2vec::word2vec_similarity( embeddings[selected_products,], embeddings, type = "cosine")/2 + 0.5
+  similarities <- distances/2 + 0.5
   
-  word2vec_similarities <- word2vec::word2vec_similarity(
-    embeddings[selected_calibration_products,],
-    embeddings[selected_calibration_products,], 
-    type = "cosine")/2 + 0.5
-  log_prior_similarities <- log_prior_similarity_mat[selected_calibration_products,
-                                                     selected_calibration_products]
-  prior_similarities <- exp(log_prior_similarities)
+  similarities %<>% t() %>% .[c(selected_products, remaining_products), selected_products]
+  match_mat %<>% .[c(selected_products, remaining_products), selected_products]
+  mismatch_mat %<>% .[c(selected_products, remaining_products), selected_products]
 
-  proximity_metric <- function(prior_similarities, word2vec_similarities)
-  {
-    word2vec_similarities_lower_tri <- word2vec_similarities %>% .[lower.tri(.)]
-    prior_similarities_lower_tri <- prior_similarities %>% .[lower.tri(.)]
-    
-    similarity    <- -1 * prior_similarities_lower_tri * log(word2vec_similarities_lower_tri)
-    dissimilarity <- -1 * (1-prior_similarities_lower_tri) * log(1-word2vec_similarities_lower_tri)
-    
-    -sum(log(similarity + dissimilarity))
-  }
+  diag(similarities[selected_products, selected_products]) <- NA
+  similarities[selected_products, selected_products][upper.tri(matrix(nrow = 200, ncol = 200))] <- NA
   
-  proximity_metric(prior_similarities, word2vec_similarities)
+  match_mat_lower_tri <- match_mat %>% .[lower.tri(.)]
+  mismatch_mat_lower_tri <- mismatch_mat %>% .[lower.tri(.)]
+  similarities_lower_tri <- similarities %>% .[lower.tri(.)]
+
+  loglik <- match_mat_lower_tri * log(similarities_lower_tri) + mismatch_mat_lower_tri * log(1-similarities_lower_tri)
+  
+  sum(loglik)
 }
-
-
-evaluate_model_by_dept_match <- function(selected_products, products_dept_match_mat, dim, window, iter = 10)
-{
-  # using: log_list_prices, transaction_baskets_df
-  
-  model <- get_word2vec(x = transaction_baskets_df$basket, dim = dim, window = window, iter = iter)
-  embeddings <- as.matrix(model)
-  
-  vocabulary <- rownames(embeddings)
-  selected_products <- selected_products[selected_products %in% vocabulary] %>% as.character()
-  
-  word2vec_similarities <- word2vec::word2vec_similarity(embeddings[selected_products,], embeddings[selected_products,], type = "cosine")/2 + 0.5
-  products_dept_match_mat <- products_dept_match_mat[selected_products, selected_products]
-
-  logloss_dept_match <- function(products_dept_match_mat, word2vec_similarities)
-  {
-    word2vec_similarities_lower_tri <- word2vec_similarities %>% .[lower.tri(.)]
-    products_dept_match_lower_tri <- products_dept_match_mat %>% .[lower.tri(.)]
-    
-    similarity    <- -1 * products_dept_match_lower_tri * log(word2vec_similarities_lower_tri)
-    dissimilarity <- -1 * (1-products_dept_match_lower_tri) * log(1-word2vec_similarities_lower_tri)
-    
-    -sum(log(similarity + dissimilarity))
-  }
-  
-  logloss_dept_match(products_dept_match_mat, word2vec_similarities)
-}
-
-max_loglik_mixture_similarity <- function(log_prior_similarities, log_estimated_similarities)
-{
-  loglik_mixture_similarity <- function(
-    log_prior_similarities, log_estimated_similarities,
-    p_max_related,
-    mu_unrelated, sigma_unrelated, 
-    mu_related, sigma_related)
-  {
-    p_related <- p_max_related * exp(log_prior_similarities)
-    log_p_mix <- log( p_related )
-    log_pm1_mix <- log( 1-p_related )
-    
-    loglik_unrelated <- dnorm(log_estimated_similarities, mean = mu_unrelated, sd = sigma_unrelated, log = T)
-    loglik_related <- dnorm(log_estimated_similarities, mean = mu_related, sd = sigma_related, log = T)
-    
-    loglik_rowwise <- cbind(log_p_mix+loglik_related, log_pm1_mix+loglik_unrelated)
-    matrixStats::rowLogSumExps(loglik_rowwise) %>% sum()
-  }
-  
-  transform_par <- function(par) {
-    par[["p_max_related"]] %<>% plogis()
-    par[["sigma_unrelated"]] %<>% exp()
-    par[["sigma_related"]] %<>% exp()
-    par
-  }
-  
-  loglik_mixture_similarity_optim <- function(par, 
-                                              log_prior_similarities, 
-                                              log_estimated_similarities)
-  {
-    par %<>% transform_par()
-    
-    loglik <-  
-      loglik_mixture_similarity(log_prior_similarities = log_prior_similarities,
-                                log_estimated_similarities = log_estimated_similarities,
-                                p_max_related = par[["p_max_related"]],
-                                mu_unrelated = par[["mu_unrelated"]], 
-                                sigma_unrelated = par[["sigma_unrelated"]],
-                                mu_related = par[["mu_related"]], 
-                                sigma_related = par[["sigma_related"]])
-    
-    #print(loglik)
-    loglik
-  }
-  
-  sample_median = median(log_estimated_similarities)
-  sample_sd = sd(log_estimated_similarities)
-  par_start <- c(p_max_related = qlogis(.1),
-                 mu_unrelated = sample_median, sigma_unrelated = log(sample_sd), 
-                 mu_related = sample_median/2, sigma_related = log(sample_sd))
-  
-  res <-
-    optim(par = par_start, loglik_mixture_similarity_optim, 
-          log_prior_similarities = log_prior_similarities, 
-          log_estimated_similarities = log_estimated_similarities, 
-          control = list(fnscale=-1, maxit = 10000) )
-  
-  res$par %<>% transform_par()
-  
-  res
-}
-
-corr_posterior <- function(y1, y2, n_samples = 1000)
-{
-  # samples from the posterior of the poisson rates (lambda) associated with the vector x
-  lambda_posterior_sample_fn <- function(x) {
-    # set prior for all elements of x based on the average of x
-    beta = 0.05
-    alpha = mean(x)*beta
-    
-    # determine parameters of conjugate posteriors for all elements of x
-    alpha_prime = x + alpha
-    beta_prime = beta + 1
-    
-    # return function to sample from posterior 
-    function(n) rgamma(n=length(x), shape = alpha_prime, scale = 1/beta_prime)
-  }
-  
-  # initialize functions to sample from posteriors associated with y1 and y2
-  y1_lambda_posterior_sample <- lambda_posterior_sample_fn(y1)
-  y2_lambda_posterior_sample <- lambda_posterior_sample_fn(y2)
-  
-  # obtain n samples from the y1 and y2 posteriors, and compute correlation 
-  corr_posterior_samples <- sapply(1:n_samples, function(i) {
-    cor(y1_lambda_posterior_sample(), y2_lambda_posterior_sample()) 
-  })
-  
-  # return 95% CI
-  quantile(corr_posterior_samples, c(0.025, 0.975))
-}
-
-
-corr_posterior_mat <- function(seasonality_mat)
-{
-  n_products <- nrow(seasonality_mat)
-  products <- rownames(seasonality_mat)
-
-  corr_mat <- map(1:n_products, function(i)
-  {
-      product_1 <- products[i] %>% as.character()
-      map_dbl(1:n_products, function(j)
-      {
-          product_2 <- products[j] %>% as.character()
-          if (i < j) { NA } 
-          else if (i == j) { 1 } 
-          else { 
-              series_1 <- seasonality_mat[as.character(product_1),]
-              series_2 <- seasonality_mat[as.character(product_2),]
-              corr_posterior(series_1, series_2)[2]
-          }
-      })
-  }, .progress = TRUE)
-  
-  corr_mat <- data.frame(corr_mat) %>% t() %>% as.matrix()
-  dimnames(corr_mat) <- NULL
-  
-  corr_mat <- ifelse(is.na(corr_mat), 0, corr_mat)
-  corr_mat <- corr_mat + t(corr_mat) - diag(diag(corr_mat))
-  
-  dimnames(corr_mat) <- list(products, products)
-  
-  corr_mat
-}
-
 
 # replace half of the calibration products by alternative labels
 sample_bool_approx_equal_n <- function(n) { 
